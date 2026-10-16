@@ -17,6 +17,8 @@ from kerbad.protocol.external import ticketutil
 from kerbad.protocol.encryption import Enctype
 from kerbad.protocol.errors import KerberosError
 from winacl.dtyp.security_descriptor import SECURITY_DESCRIPTOR
+from bloodyAD import capabilities as _capabilities
+from bloodyAD import rollback as _rollback
 
 
 async def badSuccessor(conn: ConnectionHandler, dmsa: str, t: list = ["CN=Administrator,CN=Users,DC=Current,DC=Domain"], ou: str = None, prepatch: bool = False):
@@ -30,15 +32,6 @@ async def badSuccessor(conn: ConnectionHandler, dmsa: str, t: list = ["CN=Admini
     """
 
     async def getWeakOU(conn):
-        # Check if the schema version is 2025
-        # schema_version = next(
-        #     conn.ldap.bloodysearch(
-        #         conn.ldap.schemaNC, attr=["objectVersion"], raw=True
-        #     )
-        # ).get("objectVersion", None)
-        # if int(schema_version[0]) < 91:
-        #     raise BloodyError("Schema version is not 2025. DMSA creation is not supported.")
-
         # First we try to find a OU where we can add a child object
         # If we don't find one, we will use the first one where we have DACL write on
         # If we don't find one, we will use the first one where we have ownership write on
@@ -171,13 +164,13 @@ async def badSuccessor(conn: ConnectionHandler, dmsa: str, t: list = ["CN=Admini
             LOG.error("DC2025 not found, try to reach one of the list above manually:")
             new_netloc = parsed.netloc.split("@")[0] + '@<DC2025_IP>' if '@' in parsed.netloc else parsed.netloc
             url = parse.urlunparse(parsed._replace(netloc=new_netloc, query=query_params))
-            LOG.error(f"badS4U2self '{url}' 'krbtgt/{ldap.domainname}@{ldap.domainname}' '{dmsa_sama}@{ldap.domainname}' --dmsa")
+            LOG.info("Configure a separate Kerberos client; credentials are omitted from diagnostics")
             return
 
     new_netloc = parsed.netloc.split("@")[0] + '@' + host_params["ip"] if '@' in parsed.netloc else parsed.netloc
     url = parse.urlunparse(parsed._replace(netloc=new_netloc, query=query_params))
 
-    LOG.debug(f"Using kerbad url: {url}")
+    LOG.info("Configure a separate Kerberos client; credentials are omitted from diagnostics")
     try:
         cu = factory.KerberosClientFactory.from_url(url)
         client = cu.get_client_blocking()
@@ -191,7 +184,7 @@ async def badSuccessor(conn: ConnectionHandler, dmsa: str, t: list = ["CN=Admini
         elif host_params["ip"] != conn.conf.dcip:
             LOG.error(f"{host_params['ip']} may not be synchronized to {conn.conf.dcip}, wait or try to add dMSA directly on {host_params['ip']}")
         LOG.error("Try using Rubeus, or something like:")
-        LOG.error(f"badS4U2self '{url}' 'krbtgt/{ldap.domainname}@{ldap.domainname}' '{dmsa_sama}@{ldap.domainname}' --dmsa")
+        LOG.info("Configure a separate Kerberos client; credentials are omitted from diagnostics")
         raise e
 
     kirbi = Kirbi.from_ticketdata(tgs, encTGSRepPart)
@@ -226,9 +219,10 @@ async def computer(conn: ConnectionHandler, hostname: str, newpass: str, ou: str
     if ou == "DefaultOU":
         container = None
         entry = None
-        async for e in ldap.bloodysearch(ldap.domainNC, attr=["wellKnownObjects"]):
-            entry = e
-            break
+        metadata = await ldap.read_metadata("default_containers")
+        entry = metadata[0] if metadata else {}
+        if not entry:
+            raise BloodyError("Default-container metadata is unavailable")
         for obj in entry["wellKnownObjects"]:
             if "GUID_COMPUTERS_CONTAINER_W" == obj.binary_value:
                 container = obj.dn
@@ -238,7 +232,7 @@ async def computer(conn: ConnectionHandler, hostname: str, newpass: str, ou: str
                 "Default container for computers not found, defaulting to CN=Computers,"
                 + ldap.domainNC
             )
-            container = "cn=Computers" + ldap.domainNC
+            container = "cn=Computers," + ldap.domainNC
         computer_dn = f"cn={hostname},{container}"
     else:
         computer_dn = f"cn={hostname},{ou}"
@@ -272,8 +266,11 @@ async def computer(conn: ConnectionHandler, hostname: str, newpass: str, ou: str
     # When the requester specifies LDAP_SERVER_BYPASS_QUOTA_OID control "1.2.840.113556.1.4.2256"
     # And has been granted the control access right DS-Bypass-Quota (usually only admins) on the NC's root object (e.g. DC=example,DC=com)
     # Then the requester can bypass the default machine account quota (ms-DS-MachineAccountQuota)
-    await ldap.bloodyadd(computer_dn, attributes=attr, controls=[("1.2.840.113556.1.4.2256", False, None)])
+    outcome = await _rollback.create_object(ldap, computer_dn, attr, controls=[("1.2.840.113556.1.4.2256", False, None)])
+    if outcome.status == "simulated":
+        return outcome
     LOG.info(f"{hostname}$ created")
+    return outcome
 
 
 async def dcsync(conn: ConnectionHandler, trustee: str):
@@ -464,8 +461,15 @@ async def groupMember(conn: ConnectionHandler, group: str, member: str):
     else:
         member_transformed = await ldap.dnResolver(member)
 
-    await ldap.bloodymodify(group, {"member": [(Change.ADD.value, member_transformed)]})
-    LOG.info(f"{member} added to {group}")
+    if ldap.options.rollback_file and not ldap.options.dry_run:
+        outcome = await _rollback.add_member(ldap, group, member)
+    else:
+        outcome = await ldap.bloodymodify(group, {"member": [(Change.ADD.value, member_transformed)]})
+    if outcome.status == "simulated":
+        return outcome
+    if outcome.status == "applied":
+        LOG.info(f"{member} added to {group}")
+    return outcome
 
 
 async def gmsaGroup(conn: ConnectionHandler, gmsa: str, member: str):
@@ -541,7 +545,7 @@ async def rbcd(conn: ConnectionHandler, target: str, service: str):
     LOG.info(f"{service} can now impersonate users on {target} via S4U2Proxy")
     splitted_url = ldap.co_url.split("-",1)    
     url = "kerberos+" + splitted_url[1]
-    LOG.info(f"e.g. badS4U2proxy '{url}' 'HOST/{target}@{conn.conf.domain}' 'Administrator@{conn.conf.domain}'")
+    LOG.info("Configure a separate Kerberos client; credentials are omitted from diagnostics")
 
 
 async def shadowCredentials(conn: ConnectionHandler, target: str, path: str = "CurrentPath", stealth: bool = False):
@@ -705,9 +709,10 @@ async def user(conn: ConnectionHandler, sAMAccountName: str, newpass: str, ou: s
     if ou == "DefaultOU":
         container = None
         entry = None
-        async for e in ldap.bloodysearch(ldap.domainNC, attr=["wellKnownObjects"]):
-            entry = e
-            break
+        metadata = await ldap.read_metadata("default_containers")
+        entry = metadata[0] if metadata else {}
+        if not entry:
+            raise BloodyError("Default-container metadata is unavailable")
         for obj in entry["wellKnownObjects"]:
             if "GUID_USERS_CONTAINER_W" == obj.binary_value:
                 container = obj.dn
@@ -717,7 +722,7 @@ async def user(conn: ConnectionHandler, sAMAccountName: str, newpass: str, ou: s
                 "Default container for users not found, defaulting to CN=Users,"
                 + ldap.domainNC
             )
-            container = "cn=Users" + ldap.domainNC
+            container = "cn=Users," + ldap.domainNC
         user_dn = f"cn={sAMAccountName},{container}"
     else:
         user_dn = f"cn={sAMAccountName},{ou}"
@@ -734,5 +739,11 @@ async def user(conn: ConnectionHandler, sAMAccountName: str, newpass: str, ou: s
         attr["objectClass"].append("dynamicObject")
         attr["entryTTL"] = lifetime
 
-    await ldap.bloodyadd(user_dn, attributes=attr)
+    outcome = await _rollback.create_object(ldap, user_dn, attr)
+    if outcome.status == "simulated":
+        return outcome
     LOG.info(f"{sAMAccountName} created")
+    return outcome
+
+
+_capabilities.guard_module(globals(), "add")

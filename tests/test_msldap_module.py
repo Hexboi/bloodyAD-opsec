@@ -84,9 +84,9 @@ class MSLDAPModuleTests(unittest.TestCase):
                           f"Method '{method}' should be exposed in msldap module")
     
     def test_parameter_extraction(self):
-        """Test that parameters can be extracted correctly for main.py"""
-        # This tests the fix for the parameter passing issue
-        # main.py extracts parameters using: func.__code__.co_varnames[1:func.__code__.co_argcount]
+        """Test the concrete positional parameters of generated wrappers."""
+        # Check the generated code independently of __signature__ metadata.
+        # main.py uses inspect.signature; these checks preserve the callable shape too.
         
         # Test function with parameters (to_print is now hidden)
         func = getattr(msldap, 'user')

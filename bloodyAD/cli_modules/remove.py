@@ -185,10 +185,13 @@ async def groupMember(conn: ConnectionHandler, group: str, member: str):
     else:
         member_transformed = await ldap.dnResolver(member)
 
-    await ldap.bloodymodify(
+    outcome = await ldap.bloodymodify(
         group, {"member": [(Change.DELETE.value, member_transformed)]}
     )
+    if outcome.status == "simulated":
+        return outcome
     LOG.info(f"{member} removed from {group}")
+    return outcome
 
 
 async def object(conn: ConnectionHandler, target: str):
@@ -198,8 +201,11 @@ async def object(conn: ConnectionHandler, target: str):
     :param target: sAMAccountName, DN or SID of the target
     """
     ldap = await conn.getLdap()
-    await ldap.bloodydelete(target)
+    outcome = await ldap.bloodydelete(target)
+    if outcome.status == "simulated":
+        return outcome
     LOG.info(f"{target} has been removed")
+    return outcome
 
 
 async def rbcd(conn: ConnectionHandler, target: str, service: str):
@@ -318,3 +324,6 @@ async def uac(conn: ConnectionHandler, target: str, f: list = None):
     )
 
     LOG.info(f"{f} property flags removed from {target}'s userAccountControl")
+
+from bloodyAD import capabilities as _capabilities
+_capabilities.guard_module(globals(), "remove")

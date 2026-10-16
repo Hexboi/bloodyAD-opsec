@@ -3,18 +3,20 @@ import logging, sys
 LOG = logging.getLogger('bloodyAD')
 
 def enableCliLogger(level="DEBUG"):
-    # If we want to get the logs of every library we used (and which properly defined their loggers)
+    # TRACE is a local DEBUG alias, not permission to enable dependency credential logs.
     if level == "TRACE":
-        # logging.basicConfig(
-        #         level=logging.DEBUG,
-        #         #format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        #     )
-        logging.getLogger().setLevel(logging.DEBUG)
         level = "DEBUG"
+    if level == "QUIET":
+        level = "ERROR"
     logging_level = getattr(logging, level)
     LOG.propagate = False
     LOG.setLevel(logging_level)
-    handler = logging.StreamHandler(sys.stdout)
+    for previous in list(LOG.handlers):
+        if getattr(previous, "_bloody_cli", False):
+            LOG.removeHandler(previous)
+            previous.close()
+    handler = logging.StreamHandler(sys.stderr)
+    handler._bloody_cli = True
     class SymbolFormatter(logging.Formatter):
         LEVEL_SYMBOLS = {
             logging.DEBUG: '[*]',

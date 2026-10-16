@@ -1,10 +1,17 @@
 from bloodyAD.formatters import accesscontrol, common, formatters
 from bloodyAD.exceptions import NoResultError, TooManyResultsError, LOG
+from bloodyAD.opsec import OpsecOptions
+from bloodyAD import diagnostics
+from bloodyAD.operations import WriteOutcome, PartialWriteError
+from bloodyAD.search_policy import SearchPolicy
+from ldap3.utils.conv import escape_filter_chars
 import re, os, enum, asyncio, urllib, collections
 from functools import cached_property, lru_cache
 from asn1crypto import core
 from badldap.client import MSLDAPClient
 from badldap.commons.factory import LDAPConnectionFactory
+from badldap.commons.exceptions import LDAPModifyException
+from badldap.protocol.messages import Change as LDAPChange, PartialAttribute, ModifyRequest, protocolOp, Control
 from badldap.wintypes.asn1.sdflagsrequest import SDFlagsRequestValue
 from badldap.network import reacher
 from winacl import dtyp
@@ -57,18 +64,20 @@ class Ldap(MSLDAPClient):
     conf = None
     domainNC = None
     configNC = None
-    # Format: {<AD domain name>:{"conn":<ConnectionHandler obj>, "domsid":<domain sid>}}
-    # "conn" is optional
+    # Parent ConnectionHandler; per-instance domain connections live in _trustmap.
     conn = None
     co_url = None
 
     def __init__(self, conn, target, credential):
         self._trustmap = collections.defaultdict(dict)
         self.conn = conn
+        self.options = getattr(conn, "options", OpsecOptions())
         self.conf = conn.conf
         self.co_url = None
         super().__init__(target, credential, keepalive=True)
         self.isactive = False
+        self._policy_cache = None
+        self._policy_lock = None
 
     @classmethod
     async def create(cls, conn):
@@ -184,7 +193,7 @@ class Ldap(MSLDAPClient):
         creds = creds + "@" if creds else ""
         params = "/?" + params
         co_url = f"{cnf.scheme}{auth}://{creds}{encoded_cnf['host']}{params}"
-        LOG.debug(f"Connection URL: {co_url}")
+        LOG.debug("Connection: %s", diagnostics.describe_connection(cnf))
         ldap_factory = LDAPConnectionFactory.from_url(co_url)
         
         # Create instance
@@ -217,8 +226,26 @@ class Ldap(MSLDAPClient):
         
         return instance
 
+    async def _complete_write(self, outcome):
+        try:
+            await self.options.pause()
+        except (Exception, asyncio.CancelledError) as error:
+            if outcome.completed_steps:
+                raise PartialWriteError(WriteOutcome("partial", outcome.operation,
+                                                    outcome.target, outcome.completed_steps)) from error
+            raise
+        return outcome
+
     async def bloodyadd(self, target, controls=None, **kwargs):
+        if self.options.base_dn:
+            raise ValueError("--base-dn is a search boundary and cannot authorize writes")
+        # OPSEC: dry-run short-circuit
+        if self.options.dry_run:
+            LOG.warning("[DRY-RUN] %s", diagnostics.describe_write("add", target, list(kwargs.get("attributes", {}))))
+            return WriteOutcome("simulated", "add", target)
+        # OPSEC: strip controls operator asked to disable
         if controls is not None:
+            controls = self.options.filter_controls(controls)
             t = []
             for control in controls:
                 t.append(
@@ -232,6 +259,7 @@ class Ldap(MSLDAPClient):
         _, err = await self.add(await self.dnResolver(target), controls=controls, **kwargs)
         if err:
             raise err
+        return await self._complete_write(WriteOutcome("applied", "add", target, ("add",)))
 
     async def close(self):
         if not self.isactive:
@@ -243,9 +271,15 @@ class Ldap(MSLDAPClient):
         await self.disconnect()
 
     async def bloodydelete(self, target, *args):
+        if self.options.base_dn:
+            raise ValueError("--base-dn is a search boundary and cannot authorize writes")
+        if self.options.dry_run:
+            LOG.warning(f"[DRY-RUN] bloodydelete target={target}")
+            return WriteOutcome("simulated", "delete", target)
         _, err = await self.delete(await self.dnResolver(target), *args)
         if err:
             raise err
+        return await self._complete_write(WriteOutcome("applied", "delete", target, ("delete",)))
 
     async def dnResolver(self, identity):
         """
@@ -254,9 +288,11 @@ class Ldap(MSLDAPClient):
             identity: sAMAccountName, DN, UPN, GPO name or SID of the object
         """
         if ",dc=" in identity.lower():
-            # identity is a DN, return as is
-            # We do not try to validate it because it could be from another trusted domain
+            # Explicit DNs skip name lookup, but must respect any configured boundary.
+            SearchPolicy(self.options.base_dn).validate_target(identity)
             return identity
+
+        identity = escape_filter_chars(identity)
 
         if identity.lower().startswith("s-1-"):
             # We assume identity is an SID
@@ -273,7 +309,7 @@ class Ldap(MSLDAPClient):
 
         dn = ""
         entries = self.pagedsearch(
-            ldap_filter, ["distinguishedName"], tree=self.domainNC
+            ldap_filter, ["distinguishedName"], tree=self.options.base_dn or self.domainNC
         )
         async for entry, err in entries:
             if err:
@@ -282,6 +318,8 @@ class Ldap(MSLDAPClient):
                 raise TooManyResultsError(self.domainNC, ldap_filter, entries)
             dn = entry["attributes"]["distinguishedName"]
 
+        if not dn and self.options.base_dn:
+            raise NoResultError(self.options.base_dn, ldap_filter)
         if not dn:
             # Try ambiguous name resolution as last resort for debug
             entries = self.pagedsearch(
@@ -298,24 +336,66 @@ class Ldap(MSLDAPClient):
                 )
             raise NoResultError(self.domainNC, ldap_filter)
 
+        SearchPolicy(self.options.base_dn).validate_target(dn)
         return dn
+
+    async def _modify_raw(self, target_dn, changes, controls):
+        """Send already encoded values without guessing schema cardinality."""
+        try:
+            encoded_changes = []
+            for attribute, operations in changes.items():
+                for operation, values in operations:
+                    if values is None:
+                        values = []
+                    elif isinstance(values, bytes):
+                        values = [values]
+                    if not isinstance(values, (list, tuple)) or any(not isinstance(value, bytes) for value in values):
+                        raise TypeError("Raw attribute values must be bytes")
+                    encoded_changes.append(LDAPChange({
+                        "operation": operation,
+                        "modification": PartialAttribute({"type": attribute.encode("utf-8"), "attributes": list(values)}),
+                    }))
+            message = {"protocolOp": protocolOp({"modifyRequest": ModifyRequest({
+                "object": target_dn.encode("utf-8"), "changes": encoded_changes,
+            })})}
+            if controls is not None:
+                message["controls"] = [Control(control) for control in controls]
+            message_id = await self._con.send_message(message)
+            responses = await self._con.recv_message(message_id)
+            for response in responses:
+                if isinstance(response, Exception):
+                    raise response
+                if response["protocolOp"].name == "modifyResponse":
+                    result = response.native["protocolOp"]
+                    if result["resultCode"] != "success":
+                        raise LDAPModifyException(target_dn, result["resultCode"], result["diagnosticMessage"])
+                    return True, None
+            raise RuntimeError("No modify response received")
+        except Exception as error:
+            return False, error
 
     async def bloodymodify(self, target, changes, controls=None, encode=True, is_restore=False):
         """
-		Performs the modify and modify_dn operation.
-		
-		:param target: The name of the object whose attributes are to be modified
-		:type target: str
-		:param changes: Describes the changes to be made on the object. Must be a dictionary of the following format: {'attribute': [('change_type', [value])]}
-		:type changes: dict
-		:param controls: additional controls to be passed in the query
-		:type controls: dict
-		:param encode: encode the changes provided before sending them to the server
-    	:type encode: bool
+        Perform attribute changes and, unless restoring, a separate modify_dn operation.
+
+        :param target: Name of the object whose attributes are to be modified
+        :type target: str
+        :param changes: Dictionary of {'attribute': [('change_type', [value])]}
+        :type changes: dict
+        :param controls: Optional LDAP control tuples (OID, criticality, value)
+        :type controls: list
+        :param encode: Encode values through the dependency's schema codecs when true; otherwise require bytes or lists/tuples of bytes, with None mapping to an empty value set
+        :type encode: bool
         :param is_restore: if true, distinguishedName is handled in the same modify as other attributes (required for restore operations)
         :type is_restore: bool
-		"""
+        """
+        if self.options.base_dn:
+            raise ValueError("--base-dn is a search boundary and cannot authorize writes")
+        if self.options.dry_run:
+            LOG.warning("[DRY-RUN] %s", diagnostics.describe_write("modify", target, list(changes)))
+            return WriteOutcome("simulated", "modify", target)
         if controls is not None:
+            controls = self.options.filter_controls(controls)
             t = []
             for control in controls:
                 t.append(
@@ -326,7 +406,7 @@ class Ldap(MSLDAPClient):
                     }
                 )
             controls = t
-        
+
         new_dn = ""
         attr_changes = {}
         for attr_name in changes:
@@ -336,16 +416,27 @@ class Ldap(MSLDAPClient):
                 attr_changes[attr_name] = changes[attr_name]
         target_dn = await self.dnResolver(target)
         if attr_changes:
-            _, err = await self.modify(target_dn, attr_changes, controls, encode=encode)
+            if encode:
+                _, err = await self.modify(target_dn, attr_changes, controls, encode=True)
+            else:
+                _, err = await self._modify_raw(target_dn, attr_changes, controls)
             if err:
                 raise err
+        completed = ["modify"] if attr_changes else []
         if new_dn:
-            new_rdn, new_superior = new_dn.split(",", 1)
-            old_rdn, old_superior = target_dn.split(",", 1)
-            new_superior = new_superior if new_superior != old_superior else None
-            _, err = await self._con.modify_dn(target_dn, new_rdn, newSuperior = new_superior)
-            if err:
-                raise err
+            try:
+                new_rdn, new_superior = new_dn.split(",", 1)
+                old_rdn, old_superior = target_dn.split(",", 1)
+                new_superior = new_superior if new_superior != old_superior else None
+                _, err = await self._con.modify_dn(target_dn, new_rdn, newSuperior=new_superior)
+                if err:
+                    raise err
+                completed.append("modify_dn")
+            except Exception as error:
+                if completed:
+                    raise PartialWriteError(WriteOutcome("partial", "modify", target, tuple(completed))) from error
+                raise
+        return await self._complete_write(WriteOutcome("applied" if completed else "unchanged", "modify", target, tuple(completed)))
 
     @cached_property
     def current_site(self):
@@ -354,12 +445,12 @@ class Ldap(MSLDAPClient):
         )[1]
 
     async def get_is_gc(self):
-        # If we are in a gc connection we don't have the options attribute but we can check the scheme of our connection
+        # GC may omit the server's LDAP "options" attribute; this is not self.options.
         if self.conf.scheme == "gc":
             return True
 
         NTDSDSA_OPT_IS_GC = 1
-        # Sometimes raise an error, I don't know why, maybe race condition?
+        # Query the server's GC flag when the connection scheme is not already GC.
         entry = None
         async for e in self.bloodysearch(self._serverinfo["dsServiceName"], attr=["options"]):
             entry = e
@@ -371,50 +462,88 @@ class Ldap(MSLDAPClient):
     
     @property
     def is_gc(self):
-        # Provide a synchronous property for backward compatibility where possible
-        # This will be called from synchronous code that doesn't need the actual value
+        # Scheme-only compatibility check; get_is_gc() can query the server's GC flag.
         return self.conf.scheme == "gc"
 
+    async def read_metadata(self, kind):
+        """Read fixed bootstrap metadata independently of application scope."""
+        if kind == "default_containers":
+            base, ldap_filter, attributes, scope = self.domainNC, "(objectClass=*)", ["wellKnownObjects"], 0
+        elif kind == "rootdse":
+            base, ldap_filter, attributes, scope = "", "(objectClass=*)", ["defaultNamingContext", "dnsHostName"], 0
+        elif kind == "query_policy":
+            server = self._serverinfo["dsServiceName"]
+            default = "CN=Default Query Policy,CN=Query-Policies,CN=Directory Service,CN=Windows NT,CN=Services," + self.configNC
+            match = re.search("[^,]+,CN=Sites.+", server)
+            site = "CN=NTDS Site Settings," + match.group() if match else None
+            names = [server, default] + ([site] if site else [])
+            base, scope = self.configNC, 2
+            ldap_filter = "(|" + "".join("(distinguishedName=" + escape_filter_chars(dn) + ")" for dn in names) + ")"
+            attributes = ["lDAPAdminLimits", "queryPolicyObject"]
+        else:
+            raise ValueError("Unknown metadata request")
+        stream = self.pagedsearch(ldap_filter, attributes, tree=base, search_scope=scope, raw=True)
+        entries = []
+        try:
+            async for entry, error in stream:
+                if error:
+                    raise error
+                entries.append(entry)
+        finally:
+            await stream.aclose()
+        if kind != "query_policy":
+            return [{"distinguishedName": e["objectName"], **formatters.applyFormatters(e["attributes"])} for e in entries]
+        return entries
+
     async def get_policy(self):
-        """
-        [MS-ADTS] - 3.1.1.3.4.6 LDAP Policies
-        """
-        dict_policy = {"MaxPageSize": 1000}
-
-        nTDSDSA_dn = self._serverinfo["dsServiceName"]
-        site_match = re.search("[^,]+,CN=Sites.+", nTDSDSA_dn)
-        nTDSSiteSettings_filter = ""
-        if site_match:
-            nTDSSiteSettings_dn = "CN=NTDS Site Settings," + site_match.group()
-            nTDSSiteSettings_filter = f"(distinguishedName={nTDSSiteSettings_dn})"
-        default_policy_dn = (
-            "CN=Default Query Policy,CN=Query-Policies,CN=Directory"
-            " Service,CN=Windows NT,CN=Services," + self.configNC
-        )
-        ldap_filter = f"(|(distinguishedName={nTDSDSA_dn}){nTDSSiteSettings_filter}(distinguishedName={default_policy_dn}))"
-        raw_policy = ""
-
-        async for entry, err in self.pagedsearch(
-            ldap_filter, ["lDAPAdminLimits"], tree=self.configNC
-        ):
-            if err:
-                raise err
-
-            if "lDAPAdminLimits" not in entry:
-                continue
-            if entry["objectName"] == nTDSDSA_dn:
-                raw_policy = entry["attributes"]["lDAPAdminLimits"]
-                break
-            elif entry["objectName"] == nTDSSiteSettings_dn:
-                raw_policy = entry["attributes"]["lDAPAdminLimits"]
-            elif not raw_policy and entry["objectName"] == default_policy_dn:
-                raw_policy = entry["attributes"]["lDAPAdminLimits"]
-
-        for raw_param in raw_policy:
-            param_name, _, param_val = raw_param.partition("=")
-            dict_policy[param_name] = int(param_val)
-
-        return dict_policy
+        if getattr(self, "_policy_cache", None) is not None:
+            return dict(self._policy_cache)
+        if getattr(self, "_policy_lock", None) is None:
+            self._policy_lock = asyncio.Lock()
+        async with self._policy_lock:
+            if getattr(self, "_policy_cache", None) is not None:
+                return dict(self._policy_cache)
+            entries = await self.read_metadata("query_policy")
+            server = self._serverinfo["dsServiceName"]
+            raw_limits = None
+            ordered = sorted(entries, key=lambda e: 2 if e["objectName"] == server else 0 if e["objectName"].startswith("CN=Default Query Policy,") else 1)
+            for entry in ordered:
+                attributes = entry.get("attributes", {})
+                values = attributes.get("lDAPAdminLimits")
+                references = attributes.get("queryPolicyObject", [])
+                if not isinstance(references, list):
+                    references = [references]
+                for reference in references:
+                    dn = reference.decode() if isinstance(reference, bytes) else reference
+                    SearchPolicy(self.configNC).validate_target(dn)
+                    stream = self.pagedsearch("(objectClass=*)", ["lDAPAdminLimits"], tree=dn, search_scope=0, raw=True)
+                    try:
+                        async for policy, error in stream:
+                            if error:
+                                raise error
+                            values = policy.get("attributes", {}).get("lDAPAdminLimits", values)
+                    finally:
+                        await stream.aclose()
+                if values:
+                    raw_limits = values
+            result = {"MaxPageSize": 1000}
+            if raw_limits:
+                if not isinstance(raw_limits, list):
+                    raw_limits = [raw_limits]
+                for raw_limit in raw_limits:
+                    try:
+                        text = raw_limit.decode() if isinstance(raw_limit, bytes) else raw_limit
+                        key, value = text.split("=", 1)
+                        number = int(value)
+                        if number <= 0:
+                            raise ValueError
+                        result[key] = number
+                    except (ValueError, TypeError, UnicodeError):
+                        LOG.warning("Ignoring malformed LDAP query policy value")
+            else:
+                LOG.debug("No readable LDAP query policy; using MaxPageSize=1000")
+            self._policy_cache = result
+            return dict(result)
 
     async def getTrustMap(self, nctype=NCType.ALL):
         if self._trustmap and (self._nctype & nctype) == nctype:
@@ -435,9 +564,9 @@ class Ldap(MSLDAPClient):
                     return op_fn(op_params)
                 except Exception as e:
                     LOG.error(
-                        f"Something went wrong when trying to perform '{op_name}' with '{op_params}' on {conn.conf.host} with the {conn.conf.scheme} protocol"
+                        "Inter-trust operation failed (%s); connection=%s",
+                        type(e).__name__, diagnostics.describe_connection(conn.conf),
                     )
-                    LOG.error(f"Error {type(e).__name__}: {e}")
 
         tasks = []
         for pattr in partition_map.values():
@@ -460,10 +589,16 @@ class Ldap(MSLDAPClient):
         raw=False,
     ):          
         # Handles corner case where querying default partitions (no dn provided for that)
-        if base:
+        if base and "=" not in base:
             base_dn = await self.dnResolver(base)
         else:
             base_dn = base
+
+        # Compare parsed DN components. Only ancestor SUBTREE searches can be narrowed;
+        # outside BASE/LEVEL requests and empty bases are rejected when confined.
+        base_dn = SearchPolicy(self.options.base_dn).resolve_base(base_dn, search_scope)
+        if self.options.base_dn and controls and any(c[0] == "1.2.840.113556.1.4.1340" for c in controls):
+            raise ValueError("Phantom-root searches are incompatible with --base-dn")
 
         if attr is None:
             attr = ["*"]
@@ -475,9 +610,13 @@ class Ldap(MSLDAPClient):
             req_flags = SDFlagsRequestValue({"Flags": control_flag})
             local_controls.append(("1.2.840.113556.1.4.801", True, req_flags.dump()))
 
+        # OPSEC: strip controls operator asked to disable
+        local_controls = self.options.filter_controls(local_controls)
+
         policy = await self.get_policy()
         self.ldap_query_page_size = policy["MaxPageSize"]
-        
+        page_size = max(1, self.ldap_query_page_size)
+
         # Always get raw data from pagedsearch, then apply formatters ourselves
         search_generator = self.pagedsearch(
             ldap_filter,
@@ -489,32 +628,36 @@ class Ldap(MSLDAPClient):
         )
 
         isNul = True
+        entry_count = 0
         try:
             async for entry, err in search_generator:
                 if err:
                     raise err
                 isNul = False
-                
+
                 # Apply formatting to attributes before yielding (only if not raw)
                 attributes = entry["attributes"]
                 if not raw:
                     attributes = formatters.applyFormatters(attributes)
-                
+
                 yield {
                     **{"distinguishedName": entry["objectName"]},
                     **attributes,
                 }
+
+                # Count yielded results, not transport page requests: no wire-spacing guarantee.
+                entry_count += 1
+                if self.options.sleep > 0 and entry_count % page_size == 0:
+                    await self.options.pause()
         finally:
             await search_generator.aclose()
         if isNul:
             raise NoResultError(base_dn, ldap_filter)
+        # Final pause after the search completes, between consecutive bloodysearch calls
+        if self.options.sleep > 0:
+            await self.options.pause()
 
     async def getTrusts(self, transitive=False, dns="", allow_gc=True):
-        # forest_name = ""
-        # forest_name = (
-        #     ".".join(conn.ldap._serverinfo["rootDomainNamingContext"].split(",DC="))
-        # ).split("DC=")[1]
-
         # We shouldn't need to make trust_dict async_safe cause there is no call to trust_dict before an await access it in fetchTrusts()
         trust_dict = {}
         trust_to_explore = await self.fetchTrusts(
@@ -649,8 +792,6 @@ class Ldap(MSLDAPClient):
 
         # Find all domain partitions in the forest and dc hosting them
         try:
-            # Get all domain partitions in the forest
-            # partitions = conn.ldap.bloodysearch("CN=Partitions," + conn.ldap.configNC, "(&(objectClass=crossRef)(systemFlags=3))", attr=["nCName"])
             # Find nTDSDSA objects containing msDS-HasDomainNCs and server objects parents containing dNSHostname
             ldap_conn = await newconn.getLdap()
             entries = ldap_conn.bloodysearch(
@@ -706,9 +847,9 @@ class Ldap(MSLDAPClient):
             search_results = [entry for entries in search_results for entry in entries]
         except Exception as e:
             LOG.error(
-                f"Something went wrong when trying to perform searchInForest for {domain_name}"
+                "Forest search failed (%s); connection=%s",
+                type(e).__name__, diagnostics.describe_connection(newconn.conf),
             )
-            LOG.error(f"Error {type(e).__name__}: {e}")
         finally:
             if newconn != conn and newconn._ldap:
                 await newconn._ldap.close()
@@ -761,9 +902,9 @@ class Ldap(MSLDAPClient):
             ]
         except Exception as e:
             LOG.error(
-                f"Something went wrong when trying to perform this ldap search: {bloodysearch_params} on {newconn.conf.host} with the {newconn.conf.scheme} protocol"
+                "Partition search failed (%s); connection=%s",
+                type(e).__name__, diagnostics.describe_connection(newconn.conf),
             )
-            LOG.error(f"Error {type(e).__name__}: {e}")
         finally:
             if newconn != conn and newconn._ldap:
                 await newconn._ldap.close()

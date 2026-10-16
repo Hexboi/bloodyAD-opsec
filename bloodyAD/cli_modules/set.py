@@ -1,6 +1,7 @@
 import badldap
 
 from bloodyAD import utils
+from bloodyAD import rollback as _rollback
 from bloodyAD.exceptions import LOG
 from bloodyAD.formatters import accesscontrol
 from bloodyAD.network.ldap import Change, Scope, showRecoverable
@@ -22,7 +23,7 @@ async def object(conn, target: str, attribute: str, v: list = [], raw: bool = Fa
     :param v: add value if attribute doesn't exist, replace value if attribute exists, delete if no value given, can be called multiple times if multiple values to set (e.g -v HOST/janettePC -v HOST/janettePC.bloody.local)
     :param raw: if set, will try to send the values provided as is, without any encoding
     :param b64: expect base64 values in -v (available only with --raw)
-    :param bak: if set, prints the command to restore the original attribute value
+    :param bak: record original raw values of a classified noncredential attribute; requires --rollback-file, skipped during --dry-run
     """
 
     if not raw:
@@ -61,52 +62,25 @@ async def object(conn, target: str, attribute: str, v: list = [], raw: bool = Fa
 
     ldap = await conn.getLdap()
 
-    # Query current value before modification for --bak restore command
-    restore_cmd = None
-    if bak:
-        try:
-            current_entry = None
-            async for e in ldap.bloodysearch(target, attr=[attribute], raw=True):
-                current_entry = e
-                break
+    action = None
+    if bak and not ldap.options.dry_run:
+        target_dn = await ldap.dnResolver(target)
+        previous = await _rollback.read_state(ldap, target_dn, attribute)
+        if previous is None:
+            raise _rollback.JournalConflict("Attribute backup requires an existing target")
+        action = _rollback.action_context(ldap, "restore_attribute", target_dn,
+                                          attribute=attribute, before=previous["values"])
 
-            current_values = None
-            if current_entry:
-                for key in current_entry:
-                    if key.lower() == attribute.lower() and key.lower() != "distinguishedname":
-                        current_values = current_entry[key]
-                        break
+    async def send():
+        return await ldap.bloodymodify(target, {attribute: [(Change.REPLACE.value, v)]}, encode=(not raw))
 
-            if current_values is not None:
-                if not isinstance(current_values, list):
-                    current_values = [current_values]
-
-                str_values = []
-                is_binary = False
-                for val in current_values:
-                    if isinstance(val, bytes):
-                        try:
-                            str_values.append(val.decode())
-                        except UnicodeDecodeError:
-                            is_binary = True
-                            str_values.append(base64.b64encode(val).decode())
-                    else:
-                        str_values.append(str(val))
-
-                v_args = " ".join(f"-v '{val}'" for val in str_values)
-                raw_args = " --raw --b64" if is_binary else ""
-                restore_cmd = f"set object '{target}' {attribute}{raw_args} {v_args}"
-            else:
-                restore_cmd = f"set object '{target}' {attribute}"
-        except Exception as e:
-            LOG.warning(f"Could not query current value for --bak: {e}")
-
-    await ldap.bloodymodify(
-        target, {attribute: [(Change.REPLACE.value, v)]}, encode=(not raw)
-    )
-    LOG.info(f"{target}'s {attribute} has been updated")
-    if restore_cmd is not None:
-        LOG.info(f"Restore command:\n    {restore_cmd}")
+    if action is not None:
+        outcome = await _rollback.recorded_write(ldap, action, send, attribute)
+    else:
+        outcome = await send()
+    if outcome.status == "applied":
+        LOG.info(f"{target}'s {attribute} has been updated")
+    return outcome
 
 
 async def owner(conn, target: str, owner: str):
@@ -170,7 +144,9 @@ async def password(conn, target: str, newpass: str, oldpass: str = None, stealth
 
     ldap = await conn.getLdap()
     try:
-        await ldap.bloodymodify(target, {"unicodePwd": op_list})
+        outcome = await ldap.bloodymodify(target, {"unicodePwd": op_list})
+        if outcome.status == "simulated":
+            return outcome
 
     except badldap.commons.exceptions.LDAPModifyException as e:
         if stealth:
@@ -393,3 +369,6 @@ async def restore(conn, target: str, newName: str = None, newParent: str = None)
         raise e
 
     LOG.info(f"{target} has been restored successfully under {new_dn}")
+
+from bloodyAD import capabilities as _capabilities
+_capabilities.guard_module(globals(), "set")

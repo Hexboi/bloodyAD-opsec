@@ -1,22 +1,26 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
 allow-direct-references = true
 
 [project]
-name = "bloodyAD"
+name = "bloodyad-opsec"
 authors = [
     { name="CravateRouge", email="baptiste@cravaterouge.com" },
 ]
-version = "2.5.5"
-description = "AD Privesc Swiss Army Knife"
+maintainers = [
+    { name="HexKnight" },
+]
+version = "0.1.0"
+description = "Independent bloodyAD fork with scoped OPSEC safeguards and recovery"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
+license = "MIT AND LicenseRef-Impacket AND WTFPL"
+license-files = ["LICENSE"]
 classifiers = [
         "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -24,13 +28,16 @@ dependencies = [
         "badldap>=0.7.6",
         "winacl==0.1.9",
         "asn1crypto==1.5.1",
+        "ldap3==2.9.1",
         "kerbad>=0.5.10"
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/CravateRouge/bloodyAD"
-"Bug Tracker" = "https://github.com/CravateRouge/bloodyAD/issues"
+"Homepage" = "https://github.com/Hexboi/bloodyAD-opsec"
+"Upstream" = "https://github.com/CravateRouge/bloodyAD"
 
 [project.scripts]
-bloodyAD = "bloodyAD.main:main"
-bloodyad = "bloodyAD.main:main"
+bloodyad-opsec = "bloodyAD.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bloodyAD"]

@@ -1,7 +1,8 @@
 import dataclasses
 from dataclasses import dataclass
 from bloodyAD.network.ldap import Ldap
-import os, socket
+from bloodyAD.opsec import OpsecOptions
+import os, socket, ntpath
 
 
 @dataclass
@@ -43,7 +44,7 @@ class Config:
         if self.krb_args is not None:
             self.kerberos = True
             for arg in self.krb_args:
-                key, value = arg.split("=")
+                key, value = arg.split("=", 1)
                 if key == "kdc":
                     self.kdc = value
                 elif key == "kdcc":
@@ -93,7 +94,7 @@ class Config:
             raise socket.gaierror("host in --host couldn't be resolved, provide one in --dc-ip")
 
         # Handle case where password is hashes for NTLM auth
-        if not self.kerberos and self.password and ":" in self.password:
+        if not self.kerberos and self.password and self.password.count(":") == 1:
             lmhash_maybe, nthash_maybe = self.password.split(":")
             try:
                 int(nthash_maybe, 16)
@@ -112,15 +113,19 @@ class Config:
 
         # Handle case where certificate is provided
         if self.certificate and isinstance(self.certificate, str):
-            if ":" in self.certificate:
-                self.key, self.crt = self.certificate.split(":")
+            drive, tail = ntpath.splitdrive(self.certificate)
+            if ":" in tail:
+                split = len(drive) + tail.index(":")
+                self.key, self.crt = self.certificate[:split], self.certificate[split + 1:]
             else:
                 self.crt = self.certificate
 
 class ConnectionHandler:
     _ldap = None
 
-    def __init__(self, args=None, config=None):
+    def __init__(self, args=None, config=None, *, options=None):
+        self.options = options if options is not None else OpsecOptions()
+        self._ldap = None
         auth = ""
         if args:
             scheme = "ldap"
@@ -191,4 +196,4 @@ class ConnectionHandler:
                 kwargs["dcip"] = ""
 
         newconf = dataclasses.replace(self.conf, **kwargs)
-        return ConnectionHandler(config=newconf)
+        return ConnectionHandler(config=newconf, options=self.options)

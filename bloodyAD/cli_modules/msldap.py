@@ -1,11 +1,12 @@
 """
 This module exposes methods from badldap.examples.msldapclient.MSLDAPClientConsole
-as bloodyAD CLI commands. Users can call them like:
-bloodyAD <connection_arguments> msldap <method_name> <arguments>
+as bloodyad-opsec CLI commands. Users can call them like:
+bloodyad-opsec <connection_arguments> msldap <method_name> <arguments>
 """
 
 from badldap.examples.msldapclient import MSLDAPClientConsole
 import inspect
+from bloodyAD import capabilities as _capabilities
 
 
 # Use a class to encapsulate helper functions and avoid exposing them at module level
@@ -65,6 +66,7 @@ class _MSLDAPWrapper:
         :param original_method: The original method object (to get signature for hidden params)
         :param kwargs: Arguments to pass to the method
         """
+        _capabilities.validate_capabilities("msldap", method_name, conn.options, kwargs)
         # Initialize MSLDAPClientConsole without URL (non-interactive mode)
         msldapcc = MSLDAPClientConsole()
         
@@ -92,10 +94,10 @@ class _MSLDAPWrapper:
                     kwargs[param_name] = param.default
         
         # Call the method with provided arguments
-        # Note: We don't return the result as requested - the method will print its output
+        # Passthrough methods manage their own output rather than returning CLI entries.
         await method(**kwargs)
         
-        # Return None to indicate success without returning actual results
+        # No structured result is passed to the fork's output formatter.
         return None
     
     @staticmethod
@@ -126,7 +128,7 @@ class _MSLDAPWrapper:
         docstring = "\n".join(docstring_lines)
         
         # Build the function dynamically with proper parameter names
-        # This is necessary because bloodyAD's main.py extracts parameter names from __code__.co_varnames
+        # Keep concrete call parameters consistent with the inspect.signature metadata below.
         param_names = [p.name for p in params]
         param_str = ', '.join(param_names)
         

@@ -6,6 +6,7 @@ from bloodyAD.formatters import bloodhound as bhformatter
 from badldap.commons.exceptions import LDAPSearchException
 from typing import Literal
 import re
+from bloodyAD import capabilities as _capabilities
 
 
 async def bloodhound(conn, transitive: bool = False, path: str = "CurrentPath"):
@@ -558,3 +559,6 @@ async def writable(
     else:
         async for result in search_writable(conn):
             yield result
+
+
+_capabilities.guard_module(globals(), "get")

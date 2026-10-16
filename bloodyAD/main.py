@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 from bloodyAD.patch import *
 from bloodyAD import cli_modules, ConnectionHandler, exceptions
-import sys, argparse, types, json, asyncio
+from bloodyAD.opsec import OpsecOptions
+from bloodyAD import capabilities
+from bloodyAD.operations import WriteOutcome, PartialWriteError
+from dataclasses import asdict
+import sys, argparse, types, json, asyncio, os
 
 # For dynamic argparse
 import inspect, pkgutil, importlib
 
 
 async def amain():
-    parser = argparse.ArgumentParser(description="AD Privesc Swiss Army Knife")
+    parser = argparse.ArgumentParser(
+        prog="bloodyad-opsec",
+        description="Independent bloodyAD fork with scoped OPSEC safeguards and recovery",
+    )
 
     parser.add_argument("-d", "--domain", help="Domain used for NTLM authentication")
     parser.add_argument(
@@ -17,6 +24,7 @@ async def amain():
     parser.add_argument(
         "-p",
         "--password",
+        default=os.getenv("BLOODYAD_PASSWORD"),
         help=(
             "password or LMHASH:NTHASH for NTLM authentication, password or AES/RC4 key for kerberos, password for certificate"
             " (Do not specify to trigger integrated windows authentication)"
@@ -92,6 +100,58 @@ async def amain():
         default=False,
     )
 
+    # ---- OPSEC fork options ----
+    opsec_grp = parser.add_argument_group("OPSEC (bloodyAD-opsec fork)")
+    opsec_grp.add_argument(
+        "--sleep",
+        type=float,
+        default=0.0,
+        help="Optional wrapper delays in seconds; search pauses count yielded results, not network requests (0 = off)",
+    )
+    opsec_grp.add_argument(
+        "--jitter",
+        type=float,
+        default=0.3,
+        help="Jitter ratio applied to --sleep (0.0-1.0). Default 0.3 = +/-30%%",
+    )
+    opsec_grp.add_argument(
+        "--chunk",
+        type=int,
+        default=0,
+        help="Reserved, not implemented; only 0 is accepted",
+    )
+    opsec_grp.add_argument(
+        "--base-dn",
+        type=str,
+        default=None,
+        help="Confine supported application reads to this DN; fixed metadata reads are exceptions, writes are rejected",
+    )
+    opsec_grp.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Simulate supported writes; bind and preparatory reads may still occur",
+    )
+    opsec_grp.add_argument(
+        "--no-tombstone",
+        action="store_true",
+        default=False,
+        help="Filter SHOW_DELETED / SHOW_DEACTIVATED_LINK controls on supported wrapper paths",
+    )
+    opsec_grp.add_argument(
+        "--no-phantom-root",
+        action="store_true",
+        default=False,
+        help="Filter the SEARCH_OPTIONS phantom-root control on supported wrapper paths",
+    )
+    opsec_grp.add_argument(
+        "--rollback-file",
+        type=str,
+        default=None,
+        help="Record supported changes in a version 1 JSONL recovery journal (not shell commands)",
+    )
+    # ---- end OPSEC ----
+
     subparsers = parser.add_subparsers(title="Commands")
     submodnames = []
     # Store mapping of lowercase function names to their original case for case-insensitive matching
@@ -164,7 +224,7 @@ async def amain():
 
                 subsubparser.add_argument(arg_name, **parser_args)
             # If a function name is provided in cli, arg.func will exist with function as value
-            subsubparser.set_defaults(func=function)
+            subsubparser.set_defaults(func=function, category=submodname)
 
     # Preprocess the input arguments because nargs ? and * can capture subparsers commands if put at the end
     # So we always put the --host option at the end
@@ -199,37 +259,25 @@ async def amain():
                 parsed_args.append(arg)
     args = parser.parse_args(parsed_args)
 
+
     if "func" not in args:
         parser.print_help(sys.stderr)
         sys.exit(1)
     # Get the list of parameters to provide to the command
-    param_names = args.func.__code__.co_varnames[1 : args.func.__code__.co_argcount]
+    param_names = [name for name in inspect.signature(args.func).parameters if name != "conn"]
     params = {param_name: vars(args)[param_name] for param_name in param_names}
 
-    # Configure loggers #
+    try:
+        options = OpsecOptions.from_namespace(args)
+        capabilities.validate_capabilities(args.category, args.func.__name__, options, params)
+    except ValueError as error:
+        parser.error(str(error))
 
-    # Doesn't work when launching new threads in bloodyAD.ldap so we'll use propagate to false below
-    # # Enable all children loggers in debug mode
-    # logging.getLogger().setLevel(logging.DEBUG)
-    # # Make the root logger quiet
-    # # WARNING: operation below is not thread safe!
-    # logging.getLogger().handlers = []
-
+    # Configure only the fork's CLI diagnostics; dependency/root logging stays untouched.
     exceptions.enableCliLogger(level=args.verbose)
-    # We show badldap logs only if debug is enabled
-    # import badldap
-    # if args.verbose == "DEBUG":
-    #     badldap.logger.handlers = []
-    #     handler = logging.StreamHandler(sys.stdout)
-    #     handler.setLevel(logging.DEBUG)
-    #     formatter = logging.Formatter('[badldap] %(message)s')
-    #     handler.setFormatter(formatter)
-    #     badldap.logger.addHandler(handler)
-    #     badldap.logger.setLevel(logging.DEBUG)
-    #     badldap.logger.propagate = False
 
     # Launch the command
-    conn = ConnectionHandler(args=args)
+    conn = ConnectionHandler(args=args, options=options)
     try:
         result = args.func(conn, **params)
         # Helper functions for output
@@ -270,6 +318,12 @@ async def amain():
         else:
             # Coroutine or other
             output = await result
+            if isinstance(output, WriteOutcome):
+                if args.json:
+                    print(json.dumps(asdict(output)))
+                else:
+                    print(f"{output.status}: {output.operation} {output.target}")
+                return
             output_type = type(output)
             if not output or output_type == bool:
                 return
@@ -339,7 +393,14 @@ def print_entry(entryname, entry):
         return entry
 
 def main():
-    asyncio.run(amain())
+    try:
+        asyncio.run(amain())
+    except PartialWriteError as error:
+        print(f"[-] {error}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except Exception as error:
+        print(f"[-] {type(error).__name__}: operation failed", file=sys.stderr)
+        raise SystemExit(1) from None
 
 if __name__ == "__main__":
     main()

@@ -282,6 +282,14 @@ class AceFlag:
 
 
 class LazyAdSchema:
+    def __init__(self):
+        self.guids, self.sids, self.DNs = set(), set(), set()
+        self.guid_dict = {**adschema.OBJECT_TYPES, "Self": "Self"}
+        self.sid_dict = dict(dtyp.sid.well_known_sids_sid_name_map)
+        self.dn_dict = {}
+        self.isResolved = False
+        self.conn = None
+
     guids = set()
     sids = set()
     DNs = set()
@@ -296,9 +304,7 @@ class LazyAdSchema:
     dn_dict = {}
     isResolved = False
 
-    # We resolve every guid/sid/dn in one request to be more efficient
-    # Put the load on the server instead of the client
-    # Perfect in case of bad network
+    # Batch unresolved identifiers into filters; large queues need multiple requests.
     async def _resolveAll(self):
         if self.isResolved:
             return
@@ -442,7 +448,31 @@ class LazyAdSchema:
             else:
                 return ""
 
-global_lazy_adschema = LazyAdSchema()
+class _SchemaContext:
+    """Context-local schema state, reset when its connection changes."""
+    def __init__(self):
+        from contextvars import ContextVar
+        object.__setattr__(self, "_state", ContextVar("bloodyad_schema", default=None))
+
+    def _current(self):
+        current = self._state.get()
+        if current is None:
+            current = LazyAdSchema()
+            self._state.set(current)
+        return current
+
+    def __getattr__(self, name):
+        return getattr(self._current(), name)
+
+    def __setattr__(self, name, value):
+        current = self._current()
+        if name == "conn" and current.conn is not value:
+            current = LazyAdSchema()
+            self._state.set(current)
+        setattr(current, name, value)
+
+
+global_lazy_adschema = _SchemaContext()
 
 
 class LazyGuid:

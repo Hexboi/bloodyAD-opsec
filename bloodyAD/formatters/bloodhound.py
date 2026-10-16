@@ -147,8 +147,8 @@ async def process_members(conn, bh_type_data, group_members, dn_to_sid):
     Uses dn_to_sid for fast lookup, and LazyAdSchema for unresolved DNs.
     """
     # The dn_to_sid gonna be updated by lazy schema and that's the goal
-    global_lazy_adschema.dn_dict = dn_to_sid
     global_lazy_adschema.conn = conn
+    global_lazy_adschema.dn_dict = dn_to_sid
 
     # Add all DNs to LazyAdSchema for resolution
     for members_DNs in group_members.values():

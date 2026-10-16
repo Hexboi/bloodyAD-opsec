@@ -120,7 +120,7 @@ def getFormatters():
     Returns both bloodyAD custom formatters and badldap default formatters.
     BloodyAD formatters take precedence over badldap formatters.
     """
-    def make_formatter(format_func):
+    def make_formatter(format_func, single=False):
         """Wrapper to handle list/non-list values consistently.
 
         When the input is a single-item list (the common LDAP case for
@@ -130,6 +130,8 @@ def getFormatters():
         """
         def wrapper(val):
             if isinstance(val, list):
+                if single and len(val) == 1:
+                    return format_func(val[0])
                 return [format_func(v) for v in val]
             else:
                 return format_func(val)
@@ -166,13 +168,13 @@ def getFormatters():
     formatters_map["msDS-ManagedPassword"] = make_formatter(formatGMSApass)
     
     # Account control - expect single bytes value
-    formatters_map["userAccountControl"] = make_formatter(formatAccountControl)
-    formatters_map["msDS-User-Account-Control-Computed"] = make_formatter(formatAccountControl)
+    formatters_map["userAccountControl"] = make_formatter(formatAccountControl, single=True)
+    formatters_map["msDS-User-Account-Control-Computed"] = make_formatter(formatAccountControl, single=True)
     
     # Trust attributes - expect single bytes value
-    formatters_map["trustDirection"] = make_formatter(formatTrustDirection)
-    formatters_map["trustAttributes"] = make_formatter(formatTrustAttributes)
-    formatters_map["trustType"] = make_formatter(formatTrustType)
+    formatters_map["trustDirection"] = make_formatter(formatTrustDirection, single=True)
+    formatters_map["trustAttributes"] = make_formatter(formatTrustAttributes, single=True)
+    formatters_map["trustType"] = make_formatter(formatTrustType, single=True)
     
     # Versions and levels - expect single bytes value
     formatters_map["msDS-Behavior-Version"] = make_formatter(formatFunctionalLevel)

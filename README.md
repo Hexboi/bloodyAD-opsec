@@ -1,14 +1,17 @@
 # bloodyAD-opsec
 
 A command-line tool for Active Directory security testing, based on bloodyAD.
-Read directory objects, perform authorized changes, and use scoped safeguards
-for supported operations.
+Read directory objects with ready-made enumeration presets, perform authorized
+changes, and use scoped safeguards for supported operations.
 
 This tool can modify Active Directory. Use it only with explicit authorization.
 OPSEC options do not hide activity from AD auditing or make changes atomic.
 
 ## What this fork adds
 
+- **Enumeration presets:** seven additional read-only checks for password policy,
+  user descriptions, domain level, machine account quota, AS-REP exposure, SPNs
+  and Kerberoasting exposure. See [enumeration commands](#enumeration-commands).
 - **Scoped reads:** restrict supported searches to a distinguished name (DN).
 - **Dry-run:** simulate supported writes before applying them.
 - **Recovery:** record selected changes and restore them with conflict checks.
@@ -86,12 +89,63 @@ when finished; avoid passing secrets with `-p` on the command line.
 For command-specific options, run `bloodyad-opsec get object --help`.
 Results go to stdout; diagnostics go to stderr. Add `--json` before the command for JSON output.
 
+## Enumeration commands
+
+Seven additional read-only enumeration presets select the LDAP filters and
+attributes for you. Run `bloodyad-opsec get --help` to see all commands; the new
+presets are marked `[preset]` in the `get commands` section. Use
+`bloodyad-opsec get password-policy --help` for a preset's options.
+
+Add these suffixes after your connection/authentication options:
+
+| Command | Results |
+| --- | --- |
+| `get password-policy` | Default domain password, lockout and forced-logoff policy, with readable intervals and property flags. |
+| `get users-description` | Users and descriptions, including disabled users and users without a returned description. |
+| `get domain-level` | Functional level of the contacted DC's domain. |
+| `get maq` | Domain MachineAccountQuota. |
+| `get asrep` | Users with Kerberos preauthentication disabled, including disabled users. |
+| `get spn` | All objects with SPNs; `--spn-class MSSQLSvc` selects a service class. |
+| `get kerberoastable` | Enabled users with SPNs and `msDS-SupportedEncryptionTypes` account configuration. |
+
+For example:
+
+```powershell
+bloodyad-opsec -H dc.example.test -d example.test -u tester get password-policy
+bloodyad-opsec -H dc.example.test -d example.test -u tester --json get kerberoastable --raw
+bloodyad-opsec -H dc.example.test -d example.test -u tester get users-description --base "OU=Assessment,DC=example,DC=test"
+```
+
+All seven commands support `--raw`, existing text/JSON output and an empty result
+set. They use the contacted DC's domain automatically. The four subtree commands
+(`users-description`, `asrep`, `spn`, `kerberoastable`) also accept `--base` and
+respect `--base-dn`. Root reads reject an incompatible OU confinement. Underscore
+aliases (`password_policy`, `users_description`, `domain_level`) are accepted.
+
+Password policy retains original values alongside annotations, including exact
+100-nanosecond interval conversion, special values and unknown password-property
+bits. `--raw` omits annotations. Missing attributes stay absent. This reads domain
+defaults, not FGPP/PSO or a user's resulting policy. `forceLogoff` concerns expiry
+of allowed logon hours. A missing user description can mean insufficient read
+permissions. `users-description` uses the existing text/JSON renderer, not a table.
+
+These commands enumerate configuration; they do not request roasting tickets or
+prove exploitability. Encryption types describe the account, not an issued ticket.
+`domain-level` corresponds to ADWSearch's historically named `forest-level` preset.
+
+Existing `get writable` and `get dnsDump` remain available. To approximate ADWSearch's
+defaults use `get writable --detail --partition DOMAIN --exclude-del` and
+`get dnsDump --no-detail`. BloodyAD's `writable --partition ALL` includes all
+advertised naming contexts; ADWSearch's `all` selects domain, Configuration and
+Schema. DNS coverage and aggregation differ, including TTL presentation; outputs
+are not interchangeable. Enumeration commands do not support write `--dry-run`.
+
 ## Safeguards and limits
 
 | Option | Supported use |
 | --- | --- |
 | `--dry-run` | Basic writes listed below; simulates changes, not server-side validation. |
-| `--base-dn DN` | `get object`, `get search`, `get children`; rejects writes, transitive traversal, and security descriptor resolution. Fixed metadata reads are exceptions. |
+| `--base-dn DN` | `get object`, `get search`, `get children`, and the seven enumeration commands; root reads reject incompatible OU scope. Rejects writes, transitive traversal, and security descriptor resolution. Fixed metadata reads are exceptions. |
 | `--rollback-file PATH` | Recovery journal for the operations in the next section. |
 | `--sleep SECONDS`, `--jitter RATIO` | Supported reads and basic writes. Search delays count yielded results, not LDAP requests. |
 | `--no-tombstone`, `--no-phantom-root` | Filter the named LDAP controls on supported reads and basic writes. |
@@ -100,6 +154,7 @@ Basic writes: `add user/computer/groupMember`, `set object/password`,
 and `remove object/groupMember`.
 Supported reads: `get object/search/children/membership/trusts/dnsDump/writable`,
 without `--bh`.
+The seven enumeration commands above also support delays and control filtering.
 
 Unsupported combinations, including collector and `msldap` paths, reject safeguards
 they cannot enforce. Chunking is not implemented: `--chunk` accepts only `0`.
@@ -137,6 +192,12 @@ python -m build --sdist --wheel --no-isolation
 `requirements.txt` adds development tools. Offline tests do not contact a DC.
 
 ### Isolated lab tests
+
+For the new read-only enumeration commands, run `python -m tests.run_lab enumeration`
+after configuring the lab credentials below. This suite needs no snapshot and
+compares all seven raw outputs with an independent signed/sealed Windows LDAP
+reference. It also checks CLI JSON/text, policy annotations, SPN classes, empty
+results and OU confinement. Reports contain test status, not directory exports.
 
 Copy [the configuration example](tests/secrets.json.example) to the ignored
 `tests/secrets.json` and fill it locally, or set `BLOODYAD_LAB_DOMAIN`,

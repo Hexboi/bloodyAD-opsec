@@ -11,12 +11,12 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("suite", choices=["safety", "auth", "all"])
+    parser.add_argument("suite", choices=["safety", "auth", "enumeration", "all"])
     args = parser.parse_args()
     from tests.support import LabConfig
     config = LabConfig.from_environment()
     snapshot = os.getenv("BLOODYAD_LAB_SNAPSHOT")
-    if args.suite != "auth":
+    if args.suite in ("safety", "all"):
         if not snapshot:
             parser.error("BLOODYAD_LAB_SNAPSHOT must identify the verified pre-test VM snapshot")
         uuid.UUID(snapshot)
@@ -26,6 +26,8 @@ def main():
         names.append("tests.test_integration_safety")
     if args.suite in ("auth", "all"):
         names.append("tests.test_authentication")
+    if args.suite in ("enumeration", "all"):
+        names.append("tests.test_enumeration_lab")
     suite = unittest.defaultTestLoader.loadTestsFromNames(names)
     result = unittest.TextTestRunner(verbosity=2, failfast=True).run(suite)
     report = {

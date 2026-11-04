@@ -23,6 +23,8 @@ _BASIC_WRITES = {("add", n) for n in ("user", "computer", "groupMember")}
 _BASIC_WRITES |= {("set", "object"), ("set", "password"),
                   ("remove", "object"), ("remove", "groupMember")}
 _READS = {("get", n) for n in ("object", "search", "children", "membership", "trusts", "dnsDump", "writable")}
+_ENUMERATION = {("get", n) for n in ("password_policy", "domain_level", "maq", "users_description", "asrep", "spn", "kerberoastable")}
+_READS |= _ENUMERATION
 _JOURNAL = {("add", n) for n in ("user", "computer", "groupMember")} | {("set", "object")}
 
 
@@ -32,7 +34,7 @@ def capabilities_for(category, command, command_args):
         return CommandCapabilities()
     return CommandCapabilities(
         dry_run=key in _BASIC_WRITES,
-        search_scope=key in {("get", n) for n in ("object", "search", "children")}
+        search_scope=key in ({("get", n) for n in ("object", "search", "children")} | _ENUMERATION)
                      and not command_args.get("transitive") and not command_args.get("resolve_sd"),
         filtered_controls=key in _READS | _BASIC_WRITES,
         delay=key in _READS | _BASIC_WRITES,

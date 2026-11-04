@@ -7,6 +7,90 @@ from badldap.commons.exceptions import LDAPSearchException
 from typing import Literal
 import re
 from bloodyAD import capabilities as _capabilities
+from bloodyAD import enumeration as _enumeration
+from contextlib import aclosing as _aclosing
+
+
+async def password_policy(conn, raw: bool = False):
+    """
+    [preset] Read default domain password, lockout and forced-logoff policy (not per-user FGPP)
+
+    :param raw: Return original values without policy annotations
+    """
+    async with _aclosing(_enumeration.query(conn, "password_policy", raw=raw)) as entries:
+        async for entry in entries:
+            yield entry
+
+
+async def domain_level(conn, raw: bool = False):
+    """
+    [preset] Read the contacted DC domain's functional level
+
+    :param raw: Return the numeric level without formatting
+    """
+    async with _aclosing(_enumeration.query(conn, "domain_level", raw=raw)) as entries:
+        async for entry in entries:
+            yield entry
+
+
+async def maq(conn, raw: bool = False):
+    """
+    [preset] Read the domain MachineAccountQuota
+
+    :param raw: Return original attribute values without formatting
+    """
+    async with _aclosing(_enumeration.query(conn, "maq", raw=raw)) as entries:
+        async for entry in entries:
+            yield entry
+
+
+async def users_description(conn, base: str = "DOMAIN", raw: bool = False):
+    """
+    [preset] List users and descriptions, including users without a returned description
+
+    :param base: Search base DN, defaults to the contacted DC domain
+    :param raw: Return original attribute values without formatting
+    """
+    async with _aclosing(_enumeration.query(conn, "users_description", base, raw)) as entries:
+        async for entry in entries:
+            yield entry
+
+
+async def asrep(conn, base: str = "DOMAIN", raw: bool = False):
+    """
+    [preset] List users with Kerberos preauthentication disabled, including disabled users
+
+    :param base: Search base DN, defaults to the contacted DC domain
+    :param raw: Return original attribute values without formatting
+    """
+    async with _aclosing(_enumeration.query(conn, "asrep", base, raw)) as entries:
+        async for entry in entries:
+            yield entry
+
+
+async def spn(conn, base: str = "DOMAIN", spn_class: str = "", raw: bool = False):
+    """
+    [preset] List objects with SPNs, optionally selecting a service class
+
+    :param base: Search base DN, defaults to the contacted DC domain
+    :param spn_class: Service class to select, for example MSSQLSvc or HTTP
+    :param raw: Return original attribute values without formatting
+    """
+    async with _aclosing(_enumeration.query(conn, "spn", base, raw, spn_class)) as entries:
+        async for entry in entries:
+            yield entry
+
+
+async def kerberoastable(conn, base: str = "DOMAIN", raw: bool = False):
+    """
+    [preset] List enabled users with SPNs and account encryption configuration, without requesting tickets
+
+    :param base: Search base DN, defaults to the contacted DC domain
+    :param raw: Return original attribute values without formatting
+    """
+    async with _aclosing(_enumeration.query(conn, "kerberoastable", base, raw)) as entries:
+        async for entry in entries:
+            yield entry
 
 
 async def bloodhound(conn, transitive: bool = False, path: str = "CurrentPath"):

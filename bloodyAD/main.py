@@ -10,6 +10,8 @@ import sys, argparse, types, json, asyncio, os
 # For dynamic argparse
 import inspect, pkgutil, importlib
 
+_GET_COMMAND_NAMES = {"password_policy": "password-policy", "users_description": "users-description", "domain_level": "domain-level"}
+
 
 async def amain():
     parser = argparse.ArgumentParser(
@@ -161,20 +163,26 @@ async def amain():
     for importer, submodname, ispkg in pkgutil.iter_modules(cli_modules.__path__):
         submodnames.append(submodname)
         subparser = subparsers.add_parser(
-            submodname, help=f"[{submodname.upper()}] function category"
+            submodname, help="[GET] reads and enumeration presets" if submodname == "get" else f"[{submodname.upper()}] function category"
         )
-        subsubparsers = subparser.add_subparsers(title=f"{submodname} commands")
+        subsubparsers = subparser.add_subparsers(
+            title=f"{submodname} commands",
+            description="Read-only enumeration presets select LDAP filters and attributes for you." if submodname == "get" else None,
+        )
         submodule = importlib.import_module("." + submodname, cli_modules.__name__)
         for function_name, function in inspect.getmembers(
             submodule, inspect.isfunction
         ):
             # Store case-insensitive mapping for this submodule's functions
-            function_name_map[f"{submodname}:{function_name.lower()}"] = function_name
+            command_name = _GET_COMMAND_NAMES.get(function_name, function_name) if submodname == "get" else function_name
+            function_name_map[f"{submodname}:{function_name.lower()}"] = command_name
+            function_name_map[f"{submodname}:{command_name.lower()}"] = command_name
             
             function_doc, params_doc = doc_parser(inspect.getdoc(function))
             # This formatter class prints default values
             subsubparser = subsubparsers.add_parser(
-                function_name,
+                command_name,
+                aliases=[function_name] if command_name != function_name else [],
                 help=function_doc,
                 formatter_class=argparse.ArgumentDefaultsHelpFormatter,
             )

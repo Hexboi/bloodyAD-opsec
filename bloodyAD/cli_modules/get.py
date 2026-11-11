@@ -15,9 +15,15 @@ async def adcs(conn):
     """
     Read-only AD CS analysis of templates, published CAs and NTAuth certificates
 
-    Checks: ESC1, ESC2, ESC3, ESC4, ESC9, ESC13, ESC15 and CA_OBJECT_ACL.
+    Checks: ESC1, ESC2, ESC3, ESC4, ESC9, ESC13, ESC15, ESC17 and CA_OBJECT_ACL.
     Findings are potential exposures; this command does not prove exploitation.
     CA_OBJECT_ACL concerns the CA directory object, not ESC7 service permissions.
+
+    ESC13 joins all template issuance-policy OIDs to their linked AD groups.
+    ESC17 checks enrollee-supplied subjects with Server Authentication, Any Purpose
+    or absent EKUs. Both require publication, enrollment grants, no manager
+    approval and zero authorized signatures. Unknown required settings remain
+    incomplete; linked-group eligibility and service impersonation are unverified.
 
     Domain-controller computer SIDs are identified by LDAP role flags
     SERVER_TRUST_ACCOUNT or PARTIAL_SECRETS_ACCOUNT in the contacted domain.

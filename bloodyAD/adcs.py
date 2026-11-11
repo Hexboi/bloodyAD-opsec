@@ -24,9 +24,9 @@ ANY_PURPOSE = "2.5.29.37.0"
 AGENT = "1.3.6.1.4.1.311.20.2.1"
 AUTH_EKUS = {"1.3.6.1.5.5.7.3.2", "1.3.6.1.5.2.3.4",
              "1.3.6.1.4.1.311.20.2.2", ANY_PURPOSE}
-CHECKS = ["ESC1", "ESC2", "ESC3", "ESC4", "ESC9", "ESC13", "ESC15", "CA_OBJECT_ACL"]
+CHECKS = ["ESC1", "ESC2", "ESC3", "ESC4", "ESC9", "ESC13", "ESC15", "ESC17", "CA_OBJECT_ACL"]
 UNVERIFIED_CHECKS = ["ESC5", "ESC6", "ESC7", "ESC8", "ESC10", "ESC11", "ESC12",
-                     "ESC14", "ESC16", "ESC17"]
+                     "ESC14", "ESC16"]
 ACCESS_LIMIT = "Effective access, group memberships, deny effects and trustee privilege are not verified."
 ISSUANCE_LIMITS = ["CA service enrollment permissions and issuance policy are not verified.",
                    "CA availability, trust chain and authentication acceptance are not verified."]
@@ -235,6 +235,7 @@ def _template(attributes, published, policies):
         limits.append("Absent application policies/EKUs imply unrestricted usage only if attributes are fully readable.")
     auth = None if ekus is None else not ekus or bool(AUTH_EKUS.intersection(ekus))
     any_purpose = None if ekus is None else not ekus or ANY_PURPOSE in ekus
+    server_auth = None if ekus is None else any_purpose or "1.3.6.1.5.5.7.3.1" in ekus
     subject = _bit(name_flags, 1)
     approval = _bit(enrollment_flags, 2)
     row["settings"] = {"schema_version": schema, "name_flags": name_flags,
@@ -263,11 +264,14 @@ def _template(attributes, published, policies):
                    [_bit(enrollment_flags, 0x80000), auth],
                    [*ISSUANCE_LIMITS, "DC mapping mode, identity-control prerequisites and issuance gates must be checked."])
         _candidate(row, "ESC13", "Authentication template references an issuance policy linked to an AD group.", enroll,
-                   [bool(row["linked_groups"]), auth],
-                   [*ISSUANCE_LIMITS, "Linked-group eligibility, privileges and issuance gates are unverified."])
+                   [bool(row["linked_groups"]), auth, *gates],
+                   [*ISSUANCE_LIMITS, "Linked-group eligibility, privileges and KDC authentication behavior are unverified."])
         _candidate(row, "ESC15", "Schema-v1 template accepts an enrollee-supplied subject (CVE-2024-49019 prerequisites).", enroll,
                    [None if schema is None else schema == 1, subject, *gates],
                    [*ISSUANCE_LIMITS, "CA patch status for CVE-2024-49019 is unknown."])
+        _candidate(row, "ESC17", "Enrollee supplies subject on a server-authentication-capable template.", enroll,
+                   [subject, server_auth, *gates],
+                   [*ISSUANCE_LIMITS, "A target service and additional server-impersonation prerequisites are unverified."])
     return row
 
 

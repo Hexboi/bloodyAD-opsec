@@ -192,11 +192,18 @@ Potential findings cover the following directory-visible conditions:
 | ESC9 | Omitted SID security extension on an authentication template; mapping prerequisites remain unverified. |
 | ESC13 | Authentication template issuance policy linked to an AD group. |
 | ESC15 | Schema-v1, enrollee-supplied-subject prerequisites; CA patch status remains unverified. |
+| ESC17 | Enrollee-supplied subject with Server Authentication, Any Purpose or absent EKUs; service impersonation prerequisites remain unverified. |
 | `CA_OBJECT_ACL` | CA directory-object ownership or modification rights held by a trustee outside the privileged/DC baseline. |
 
 Active enrollment candidates require a published template. Known manager approval
-or authorized-signature requirements block the automatic-issuance ESC1/2/3/15 rules.
-ESC13 correlates issuance-policy OIDs with linked groups. Unpublished templates
+or authorized-signature requirements block the automatic-issuance ESC1/2/3/13/15/17 rules.
+ESC13 correlates every returned issuance-policy OID with all linked groups,
+keeping those policy OIDs separate from the template's identifier OID. A linked
+group does not by itself prove that the group is privileged or eligible for
+authentication mechanism assurance. ESC17 identifies server-authentication
+certificate prerequisites, not client authentication or an exploitable target
+service. Both rules retain their unverified prerequisites in each finding.
+Unpublished templates
 remain visible; their modification rights can produce a latent ESC4 finding,
 but they are not reported as active enrollment paths. `CA_OBJECT_ACL` identifies
 dangerous grants on the CA's AD object; it does **not** establish ESC7 service
@@ -226,7 +233,7 @@ CA-side enrollment permissions, CA/DC registry settings, service availability,
 patch status, agent restrictions and HTTP/RPC protections remain **unverified**.
 In particular, ESC9 depends on external mapping/identity prerequisites and ESC15
 depends on CA patch status. Other ESC techniques, including full ESC5 and
-ESC6/7/8/10/11/12/14/16/17, are outside coverage. Empty results or no findings do
+ESC6/7/8/10/11/12/14/16, are outside coverage. Empty results or no findings do
 not establish safety: directory visibility and unverified prerequisites limit
 both positive and negative conclusions. LDAP permission/transport errors fail
 the command rather than being reported as a clean result.

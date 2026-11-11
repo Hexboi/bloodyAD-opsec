@@ -135,10 +135,10 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["acl"][0]["sid"], "S-1-5-32-544")
 
     async def test_template_rules(self):
-        cases = [({"pKIExtendedKeyUsage": [ANY_PURPOSE]}, {"ESC1", "ESC2"}),
+        cases = [({"pKIExtendedKeyUsage": [ANY_PURPOSE]}, {"ESC1", "ESC2", "ESC17"}),
                  ({"pKIExtendedKeyUsage": [AGENT]}, {"ESC3"}),
                  ({"msPKI-Enrollment-Flag": [0x80000]}, {"ESC1", "ESC9"}),
-                 ({"msPKI-Template-Schema-Version": [1], "pKIExtendedKeyUsage": [SERVER_AUTH]}, {"ESC15"}),
+                 ({"msPKI-Template-Schema-Version": [1], "pKIExtendedKeyUsage": [SERVER_AUTH]}, {"ESC15", "ESC17"}),
                  ({"msPKI-Certificate-Name-Flag": [0x400000]}, set())]
         for changes, expected in cases:
             with self.subTest(changes=changes):
@@ -200,6 +200,71 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["linked_groups"], [GROUP])
         row = await self.analyze(template(**{"msPKI-Cert-Template-OID": [POLICY]}), policies=[policy])
         self.assertNotIn("ESC13", self.ids(row))
+
+    async def test_esc13_preserves_all_issuance_policy_group_links(self):
+        other_policy = "1.2.3.5"
+        other_group = "CN=OtherCertificateUsers,CN=Users,DC=example,DC=test"
+        policies = [
+            {"distinguishedName": "CN=First,CN=OID," + PKI,
+             "msPKI-Cert-Template-OID": [POLICY], "msDS-OIDToGroupLink": [GROUP]},
+            {"distinguishedName": "CN=Second,CN=OID," + PKI,
+             "msPKI-Cert-Template-OID": [other_policy], "msDS-OIDToGroupLink": [other_group]},
+        ]
+        row = await self.analyze(template(**{"msPKI-Certificate-Name-Flag": [0],
+                                            "msPKI-Certificate-Policy": [b"1.2.3.0", POLICY.encode(), other_policy.encode()]}),
+                                 policies=policies)
+        self.assertEqual(self.ids(row), {"ESC13"})
+        self.assertEqual(row["linked_groups"], sorted([GROUP, other_group]))
+        self.assertEqual(row["issuance_policies"], ["1.2.3.0", POLICY, other_policy])
+        self.assertEqual(row["findings"][0]["principals"], [USER])
+
+    async def test_esc13_requires_known_issuance_gates_and_enrollment(self):
+        policy = {"distinguishedName": "CN=Policy,CN=OID," + PKI,
+                  "msPKI-Cert-Template-OID": [POLICY], "msDS-OIDToGroupLink": [GROUP]}
+        for changes in ({"msPKI-Enrollment-Flag": [2]}, {"msPKI-RA-Signature": [1]},
+                        {"msPKI-Enrollment-Flag": []}, {"msPKI-RA-Signature": [b"invalid"]},
+                        {"nTSecurityDescriptor": [descriptor()]}, {"pKIExtendedKeyUsage": [SERVER_AUTH]}):
+            with self.subTest(changes=changes):
+                row = await self.analyze(template(**{"msPKI-Certificate-Name-Flag": [0],
+                                                    "msPKI-Certificate-Policy": [POLICY], **changes}), policies=[policy])
+                self.assertNotIn("ESC13", self.ids(row))
+        row = await self.analyze(template(**{"msPKI-Certificate-Policy": [POLICY]}), policies=[policy], cas=[])
+        self.assertNotIn("ESC13", self.ids(row))
+
+    async def test_esc17_server_authentication_any_purpose_and_absent_ekus(self):
+        for ekus, expected in (([SERVER_AUTH], {"ESC17"}),
+                               ([SERVER_AUTH, CLIENT_AUTH], {"ESC1", "ESC17"}),
+                               ([ANY_PURPOSE], {"ESC1", "ESC2", "ESC17"}),
+                               ([], {"ESC1", "ESC2", "ESC17"})):
+            with self.subTest(ekus=ekus):
+                row = await self.analyze(template(pKIExtendedKeyUsage=ekus))
+                self.assertEqual(self.ids(row), expected)
+                finding = next(item for item in row["findings"] if item["id"] == "ESC17")
+                self.assertEqual(finding["principals"], [USER])
+                self.assertEqual(finding["status"], "potential")
+                self.assertTrue(finding["unverified"])
+
+    async def test_esc17_requires_subject_enrollment_publication_and_issuance_gates(self):
+        for changes in ({"msPKI-Certificate-Name-Flag": [0]}, {"msPKI-Certificate-Name-Flag": [65536]},
+                        {"msPKI-Certificate-Name-Flag": []}, {"msPKI-Enrollment-Flag": [2]},
+                        {"msPKI-RA-Signature": [1]}, {"msPKI-RA-Signature": []},
+                        {"nTSecurityDescriptor": [descriptor(ace(sid=ADMIN))]},
+                        {"nTSecurityDescriptor": [descriptor(ace(guid=AUTOENROLL))]},
+                        {"nTSecurityDescriptor": [descriptor(ace(0x40000000, None))]},
+                        {"pKIExtendedKeyUsage": [CLIENT_AUTH]}, {"pKIExtendedKeyUsage": [b"invalid"]}):
+            with self.subTest(changes=changes):
+                row = await self.analyze(template(**{"pKIExtendedKeyUsage": [SERVER_AUTH], **changes}))
+                self.assertNotIn("ESC17", self.ids(row))
+        row = await self.analyze(template(pKIExtendedKeyUsage=[SERVER_AUTH]), cas=[])
+        self.assertNotIn("ESC17", self.ids(row))
+
+    async def test_esc17_uses_effective_application_policies(self):
+        row = await self.analyze(template(**{"pKIExtendedKeyUsage": [CLIENT_AUTH],
+                                            "msPKI-Certificate-Application-Policy": [SERVER_AUTH]}))
+        self.assertEqual(self.ids(row), {"ESC17"})
+        row = await self.analyze(template(**{"pKIExtendedKeyUsage": [SERVER_AUTH],
+                                            "msPKI-Certificate-Application-Policy": [CLIENT_AUTH]}))
+        self.assertEqual(self.ids(row), {"ESC1"})
 
     async def test_application_policy_precedes_eku_and_ra_policies_are_separate(self):
         row = await self.analyze(template(**{"msPKI-Certificate-Application-Policy": [SERVER_AUTH],
@@ -297,7 +362,7 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         from bloodyAD.adcs import analyze
         machine_sid = "S-1-5-21-1-2-3-1001"
         ordinary = dc_entry(machine_sid, 4096)
-        ordinary["distinguishedName"] = "CN=KINGSLANDING,OU=Domain Controllers," + FakeLdap.domainNC
+        ordinary["distinguishedName"] = "CN=DC01,OU=Domain Controllers," + FakeLdap.domainNC
         ordinary["primaryGroupID"] = [b"516"]
         malformed = dc_entry(machine_sid)
         malformed["objectSid"] = [b"invalid"]
@@ -350,6 +415,9 @@ class AnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["kind"], "coverage")
         self.assertIn("ESC7", rows[0]["unverified_checks"])
+        self.assertIn("ESC13", rows[0]["checks"])
+        self.assertIn("ESC17", rows[0]["checks"])
+        self.assertNotIn("ESC17", rows[0]["unverified_checks"])
         self.assertEqual(len(ldap.calls), 4)
         self.assertEqual(len(ldap.closed), 4)
         for base, ldap_filter, options in ldap.calls:
@@ -449,7 +517,7 @@ class CliTests(unittest.TestCase):
         cases = [(["--help"], ["AD CS"]),
                  (["get", "--help"], ["adcs", "AD CS"]),
                  (["get", "adcs", "--help"],
-                  ["ESC1", "ESC15", "CA_OBJECT_ACL", "excluded_dc_sids",
+                  ["ESC1", "ESC13", "ESC15", "ESC17", "CA_OBJECT_ACL", "excluded_dc_sids",
                    "SERVER_TRUST_ACCOUNT", "PARTIAL_SECRETS_ACCOUNT", "--json",
                    "--base-dn", "--dry-run", "--rollback-file", "--raw", "HTTP/RPC"])]
         for args, expected in cases:

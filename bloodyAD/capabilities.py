@@ -25,6 +25,7 @@ _BASIC_WRITES |= {("set", "object"), ("set", "password"),
 _READS = {("get", n) for n in ("object", "search", "children", "membership", "trusts", "dnsDump", "writable")}
 _ENUMERATION = {("get", n) for n in ("password_policy", "domain_level", "maq", "users_description", "asrep", "spn", "kerberoastable")}
 _READS |= _ENUMERATION
+_READS.add(("get", "adcs"))
 _JOURNAL = {("add", n) for n in ("user", "computer", "groupMember")} | {("set", "object")}
 
 

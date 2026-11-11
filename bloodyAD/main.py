@@ -16,7 +16,7 @@ _GET_COMMAND_NAMES = {"password_policy": "password-policy", "users_description":
 async def amain():
     parser = argparse.ArgumentParser(
         prog="bloodyad-opsec",
-        description="Independent bloodyAD fork with scoped OPSEC safeguards and recovery",
+        description="Independent bloodyAD fork with enumeration presets, read-only AD CS analysis, scoped OPSEC safeguards and recovery",
     )
 
     parser.add_argument("-d", "--domain", help="Domain used for NTLM authentication")
@@ -163,11 +163,11 @@ async def amain():
     for importer, submodname, ispkg in pkgutil.iter_modules(cli_modules.__path__):
         submodnames.append(submodname)
         subparser = subparsers.add_parser(
-            submodname, help="[GET] reads and enumeration presets" if submodname == "get" else f"[{submodname.upper()}] function category"
+            submodname, help="[GET] reads, enumeration presets and AD CS analysis" if submodname == "get" else f"[{submodname.upper()}] function category"
         )
         subsubparsers = subparser.add_subparsers(
             title=f"{submodname} commands",
-            description="Read-only enumeration presets select LDAP filters and attributes for you." if submodname == "get" else None,
+            description="Read-only enumeration presets select LDAP filters and attributes for you. Use get adcs for LDAP-only AD CS analysis." if submodname == "get" else None,
         )
         submodule = importlib.import_module("." + submodname, cli_modules.__name__)
         for function_name, function in inspect.getmembers(
@@ -179,12 +179,14 @@ async def amain():
             function_name_map[f"{submodname}:{command_name.lower()}"] = command_name
             
             function_doc, params_doc = doc_parser(inspect.getdoc(function))
+            adcs_help = submodname == "get" and function_name == "adcs"
             # This formatter class prints default values
             subsubparser = subsubparsers.add_parser(
                 command_name,
                 aliases=[function_name] if command_name != function_name else [],
                 help=function_doc,
-                formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+                description=inspect.getdoc(function) if adcs_help else None,
+                formatter_class=argparse.RawDescriptionHelpFormatter if adcs_help else argparse.ArgumentDefaultsHelpFormatter,
             )
             # Gets function signature to extract parameters default values
             func_signature = inspect.signature(function)

@@ -11,6 +11,39 @@ from bloodyAD import enumeration as _enumeration
 from contextlib import aclosing as _aclosing
 
 
+async def adcs(conn):
+    """
+    Read-only AD CS analysis of templates, published CAs and NTAuth certificates
+
+    Checks: ESC1, ESC2, ESC3, ESC4, ESC9, ESC13, ESC15 and CA_OBJECT_ACL.
+    Findings are potential exposures; this command does not prove exploitation.
+    CA_OBJECT_ACL concerns the CA directory object, not ESC7 service permissions.
+
+    Domain-controller computer SIDs are identified by LDAP role flags
+    SERVER_TRUST_ACCOUNT or PARTIAL_SECRETS_ACCOUNT in the contacted domain.
+    They are excluded only from CA_OBJECT_ACL and listed as excluded_dc_sids.
+    Original ACL evidence remains visible; unresolved trustees remain reportable.
+
+    Output: coverage, CA and template records, with settings, publication,
+    ACL evidence, trustee SIDs, findings and unverified prerequisites.
+    No enrollment, directory writes or CA HTTP/RPC connections are performed.
+    CA patches, service permissions, DC mapping and effective access are unverified.
+
+    Examples:
+      bloodyad-opsec -H dc.example.test -d example.test -u tester get adcs
+      bloodyad-opsec -H dc.example.test -d example.test -u tester --json get adcs
+
+    Put global options before get: --json, --sleep, --jitter, --no-tombstone
+    and --no-phantom-root. --base-dn, --dry-run and --rollback-file are rejected.
+    This analysis command has no --raw option. Help does not connect to AD.
+    """
+    from bloodyAD.adcs import analyze
+
+    async with _aclosing(analyze(conn)) as entries:
+        async for entry in entries:
+            yield entry
+
+
 async def password_policy(conn, raw: bool = False):
     """
     [preset] Read default domain password, lockout and forced-logoff policy (not per-user FGPP)
